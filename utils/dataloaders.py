@@ -104,6 +104,7 @@ def create_dataloader(path,
                       imgsz,
                       batch_size,
                       stride,
+                      single_label_file=None,
                       single_cls=False,
                       hyp=None,
                       augment=False,
@@ -123,6 +124,7 @@ def create_dataloader(path,
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(
             path,
+            single_label_file,
             imgsz,
             batch_size,
             augment=augment,  # augmentation
@@ -438,6 +440,7 @@ class LoadImagesAndLabels(Dataset):
 
     def __init__(self,
                  path,
+                 single_label_file=None,
                  img_size=640,
                  batch_size=16,
                  augment=False,
@@ -460,7 +463,7 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
-
+        self.single_label_file = single_label_file  # single label file for all images
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -477,13 +480,18 @@ class LoadImagesAndLabels(Dataset):
                 else:
                     raise FileNotFoundError(f'{prefix}{p} does not exist')
             self.im_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+
             # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
             assert self.im_files, f'{prefix}No images found'
         except Exception as e:
             raise Exception(f'{prefix}Error loading data from {path}: {e}\n{HELP_URL}') from e
 
         # Check cache
-        self.label_files = img2label_paths(self.im_files)  # labels
+        if not (self.single_label_file and isinstance(self.single_label_file, str)):
+            self.label_files = img2label_paths(self.im_files)  # labels
+        else:
+            #each item in self.im_files is a string object, create a path from it and resolve it so that it removes the .. and . from the path, and log the progress with tqdm
+            self.im_files = [str(Path(x).resolve()) for x in tqdm(self.im_files, desc='resolving image abs path')]
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')
         try:
             cache, exists = np.load(cache_path, allow_pickle=True).item(), True  # load dict
@@ -608,26 +616,73 @@ class LoadImagesAndLabels(Dataset):
         x = {}  # dict
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f'{prefix}Scanning {path.parent / path.stem}...'
-        with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
-                        desc=desc,
-                        total=len(self.im_files),
-                        bar_format=TQDM_BAR_FORMAT)
-            for im_file, lb, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
-                nm += nm_f
-                nf += nf_f
-                ne += ne_f
-                nc += nc_f
-                if im_file:
-                    x[im_file] = [lb, shape, segments]
-                if msg:
-                    msgs.append(msg)
-                pbar.desc = f'{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt'
+        if self.single_label_file:
+            #read label from yaml file
+            with open(self.single_label_file) as f:
+                print("loading label file...{self.single_label_file}, could take some time",)
+                label_as_dict = yaml.load(f, Loader=yaml.FullLoader)
+            #each key of label_as_dict is a relative path to an image, we wanto to make it absolute path
+            label_as_dict_abs_path_key = {}
+            for key in tqdm(label_as_dict.keys(),desc="resolving the absolute image path in the label file"):
+                #self.single_label_file is a string object to the label file, we want to get the parent directory first
+                abs_path = os.path.join(Path(self.single_label_file).parent, key)
+                abs_path = Path(abs_path).resolve()
+                #convert Path to string 
+                label_as_dict_abs_path_key[str(abs_path)] = label_as_dict[key]
+            label_as_dict = label_as_dict_abs_path_key
+            #check if label_as_dict is a dict
+            if not isinstance(label_as_dict, dict):
+                raise TypeError("single label file must be a dict stored in yaml format")
+            with Pool(NUM_THREADS) as pool:
+                pbar = tqdm(pool.imap(verify_image, zip(self.im_files, repeat(prefix))),
+                            desc=desc,
+                            total=len(self.im_files),
+                            bar_format=TQDM_BAR_FORMAT)
+                for im_file, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                    nm += nm_f
+                    nf += nf_f
+                    ne += ne_f
+                    nc += nc_f
+                    if im_file:
+                        #find its label
+                        lb_as_strarray = label_as_dict[im_file] 
+                        if lb_as_strarray is None:
+                            raise ValueError("label file must be a dict stored in yaml format")
+                        #parse string to np.array
+                        tmp_array = []
+                        for lb_str in lb_as_strarray:
+                            tmp_array.append(np.fromstring(lb_str,dtype=np.float32,sep=' '))
+                        lb = np.vstack(tmp_array)
+                        x[im_file] = [lb, shape, segments]
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f'{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt'
+                #get the length of x
+                nf = len(x)
+            pbar.close()
+            # return dict label_as_dict key as list
+            self.label_files = list(label_as_dict.keys())
+        else:
+            with Pool(NUM_THREADS) as pool:
+                pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
+                            desc=desc,
+                            total=len(self.im_files),
+                            bar_format=TQDM_BAR_FORMAT)
+                for im_file, lb, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
+                    nm += nm_f
+                    nf += nf_f
+                    ne += ne_f
+                    nc += nc_f
+                    if im_file:
+                        x[im_file] = [lb, shape, segments]
+                    if msg:
+                        msgs.append(msg)
+                    pbar.desc = f'{desc} {nf} images, {nm + ne} backgrounds, {nc} corrupt'
 
-        pbar.close()
+            pbar.close()
         if msgs:
             LOGGER.info('\n'.join(msgs))
-        if nf == 0:
+        if self.label_files and nf == 0:
             LOGGER.warning(f'{prefix}WARNING ⚠️ No labels found in {path}. {HELP_URL}')
         x['hash'] = get_hash(self.label_files + self.im_files)
         x['results'] = nf, nm, ne, nc, len(self.im_files)
@@ -986,6 +1041,30 @@ def autosplit(path=DATASETS_DIR / 'coco128/images', weights=(0.9, 0.1, 0.0), ann
             with open(path.parent / txt[i], 'a') as f:
                 f.write(f'./{img.relative_to(path.parent).as_posix()}' + '\n')  # add image to txt file
 
+def verify_image(args):
+    im_file,prefix = args
+    # Verify imaage file
+    nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
+    try:
+        # verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+        assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+        if im.format.lower() in ('jpg', 'jpeg'):
+            with open(im_file, 'rb') as f:
+                f.seek(-2, 2)
+                if f.read() != b'\xff\xd9':  # corrupt JPEG
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                    msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+        
+        return im_file, shape, segments, nm, nf, ne, nc, msg
+
+    except Exception as e:
+        nc = 1
+        msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
+        return [None, None, None, nm, nf, ne, nc, msg]
 
 def verify_image_label(args):
     # Verify one image-label pair
