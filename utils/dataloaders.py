@@ -646,8 +646,9 @@ class LoadImagesAndLabels(Dataset):
                     if im_file:
                         #find its label
                         lb_as_strarray = label_as_dict[im_file] 
-                        if lb_as_strarray is None:
-                            raise ValueError("label file must be a dict stored in yaml format")
+                        if lb_as_strarray is None or len(lb_as_strarray)==0:
+                            print(f"{im_file} label is not found or image corrupted")
+                            continue
                         #parse string to np.array
                         tmp_array = []
                         for lb_str in lb_as_strarray:

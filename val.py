@@ -173,13 +173,13 @@ def run(
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
         #check if data_dict has key label
-        if 'label' not in data:
-            data['label'] = None
+        if 'val_label' not in data:
+            data['val_label'] = None
         dataloader = create_dataloader(data[task],
                                        imgsz,
                                        batch_size,
                                        stride,
-                                       None,#single_label_file
+                                       data['val_label'],#single_label_file
                                        single_cls,
                                        pad=pad,
                                        rect=rect,

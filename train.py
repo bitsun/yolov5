@@ -184,14 +184,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info('Using SyncBatchNorm()')
     #check if data_dict has key label
-    if 'label' not in data_dict:
-        data_dict['label'] = None
+    if 'train_label' not in data_dict:
+        data_dict['train_label'] = None
     # Trainloader
     train_loader, dataset = create_dataloader(train_path,
                                               imgsz,
                                               batch_size // WORLD_SIZE,
                                               gs,
-                                              data_dict['label'],
+                                              data_dict['train_label'],
                                               single_cls,
                                               hyp=hyp,
                                               augment=True,
@@ -208,13 +208,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     mlc = int(labels[:, 0].max())  # max label class
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
+    #check if data_dict has key label
+    if 'val_label' not in data_dict:
+        data_dict['val_label'] = None
     # Process 0
     if RANK in {-1, 0}:
         val_loader = create_dataloader(val_path,
                                        imgsz,
                                        batch_size // WORLD_SIZE * 2,
                                        gs,
-                                       data_dict['label'],
+                                       data_dict['val_label'],
                                        single_cls,
                                        hyp=hyp,
                                        cache=None if noval else opt.cache,
